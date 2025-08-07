@@ -1,6 +1,6 @@
 import os
 import time
-from typing import List
+from typing import List, Tuple
 import concurrent.futures as cf
 
 from fastapi import FastAPI, HTTPException
@@ -8,63 +8,44 @@ from pydantic import BaseModel, Field
 from openai import OpenAI
 
 MODEL = "gpt-5"
-MAX_OUTPUT_TOKENS = 30000          # cap per call
-MAX_WORKERS = 16                   # limit fanout
+MAX_OUTPUT_TOKENS = 30000
+MAX_WORKERS = 100
+MAX_GENS = 100
+TOURNAMENT_THRESHOLD = 20
+GROUP_SIZE = 10
 
 app = FastAPI(title="Pro Mode (OpenAI Responses API, GPT-5)")
 
-
-# ---------- Pydantic Schemas ----------
+# ---------- Schemas ----------
 class ProModeRequest(BaseModel):
     prompt: str = Field(..., min_length=1)
-    num_gens: int = Field(..., ge=1, le=32)  # keep sane upper bound
-
+    num_gens: int = Field(..., ge=1, le=MAX_GENS)
 
 class ProModeResponse(BaseModel):
     final: str
     candidates: List[str]
 
-
 # ---------- Helpers ----------
 def _extract_text(resp) -> str:
-    """Robustly extract text from a Responses API result."""
-    # Preferred: SDK convenience
     txt = getattr(resp, "output_text", None)
     if txt:
         return txt
-
-    # Fallback: walk the structured output
     parts: List[str] = []
-    output = getattr(resp, "output", None)
-    if not output and isinstance(resp, dict):
-        output = resp.get("output")
-
-    if output:
-        for item in output:
-            content = getattr(item, "content", None)
-            if content is None and isinstance(item, dict):
-                content = item.get("content")
-            if not content:
-                continue
-            for c in content:
-                ctype = getattr(c, "type", None) or (isinstance(c, dict) and c.get("type"))
-                if ctype in ("output_text", "text"):
-                    text = getattr(c, "text", None) or (isinstance(c, dict) and c.get("text"))
-                    if text:
-                        parts.append(text)
+    for item in getattr(resp, "output", []) or []:
+        for c in getattr(item, "content", []) or []:
+            if getattr(c, "type", None) in ("output_text", "text"):
+                parts.append(getattr(c, "text", ""))
     return "".join(parts).strip()
 
-
 def _one_completion(api_key: str, prompt: str, temperature: float) -> str:
-    """Single non-streaming completion with simple retry/backoff."""
     delay = 0.5
     for attempt in range(3):
         try:
-            client = OpenAI(api_key=api_key)  # per-thread client for safety
+            client = OpenAI(api_key=api_key)  # per-thread client
             resp = client.responses.create(
                 model=MODEL,
                 input=prompt,
-                temperature=temperature,       # 0.9 for candidates; 0.2 for synthesis
+                temperature=temperature,
                 top_p=1,
                 max_output_tokens=MAX_OUTPUT_TOKENS,
             )
@@ -76,8 +57,7 @@ def _one_completion(api_key: str, prompt: str, temperature: float) -> str:
             delay *= 2
     return ""
 
-
-def _build_synthesis_inputs(candidates: List[str]) -> tuple[str, str]:
+def _build_synthesis_io(candidates: List[str]) -> Tuple[str, str]:
     numbered = "\n\n".join(
         f"<cand {i+1}>\n{txt}\n</cand {i+1}>" for i, txt in enumerate(candidates)
     )
@@ -92,50 +72,77 @@ def _build_synthesis_inputs(candidates: List[str]) -> tuple[str, str]:
     )
     return instructions, user
 
-
-def _pro_mode(api_key: str, prompt: str, n_runs: int) -> ProModeResponse:
-    # 1) Fan out candidates at high T
-    num_workers = min(n_runs, MAX_WORKERS)
-    candidates: List[str] = [""] * n_runs
-    with cf.ThreadPoolExecutor(max_workers=num_workers) as ex:
-        fut_to_idx = {
-            ex.submit(_one_completion, api_key, prompt, 0.9): i
-            for i in range(n_runs)
-        }
-        for fut in cf.as_completed(fut_to_idx):
-            i = fut_to_idx[fut]
-            candidates[i] = fut.result()
-
-    # Filter empty/failed
-    filtered = [c for c in candidates if c and c.strip()]
-    if not filtered:
-        raise HTTPException(status_code=503, detail="All candidate generations failed.")
-
-    # 2) Synthesis pass at low T using Responses API `instructions`
-    client = OpenAI(api_key=api_key)
-    instructions, user = _build_synthesis_inputs(filtered)
-    final_resp = client.responses.create(
+def _synthesize(client: OpenAI, candidates: List[str]) -> str:
+    instructions, user = _build_synthesis_io(candidates)
+    resp = client.responses.create(
         model=MODEL,
-        instructions=instructions,  # acts like a system message
+        instructions=instructions,
         input=user,
         temperature=0.2,
         top_p=1,
         max_output_tokens=MAX_OUTPUT_TOKENS,
     )
-    final_text = _extract_text(final_resp)
+    return _extract_text(resp)
 
+def _chunk(lst: List[str], size: int) -> List[List[str]]:
+    return [lst[i:i+size] for i in range(0, len(lst), size)]
+
+def _fanout_candidates(api_key: str, prompt: str, n_runs: int, temp: float = 0.9) -> List[str]:
+    num_workers = min(n_runs, MAX_WORKERS)
+    results: List[str] = [""] * n_runs
+    with cf.ThreadPoolExecutor(max_workers=num_workers) as ex:
+        fut_to_idx = {
+            ex.submit(_one_completion, api_key, prompt, temp): i
+            for i in range(n_runs)
+        }
+        for fut in cf.as_completed(fut_to_idx):
+            i = fut_to_idx[fut]
+            results[i] = fut.result()
+    return results
+
+def _pro_mode_simple(api_key: str, prompt: str, n_runs: int) -> ProModeResponse:
+    candidates = _fanout_candidates(api_key, prompt, n_runs, temp=0.9)
+    filtered = [c for c in candidates if c and c.strip()]
+    if not filtered:
+        raise HTTPException(status_code=503, detail="All candidate generations failed.")
+    client = OpenAI(api_key=api_key)
+    final_text = _synthesize(client, filtered)
     return ProModeResponse(final=final_text, candidates=candidates)
 
+def _pro_mode_tournament(api_key: str, prompt: str, n_runs: int) -> ProModeResponse:
+    # Round 1: fan out all candidates
+    candidates = _fanout_candidates(api_key, prompt, n_runs, temp=0.9)
+    filtered = [c for c in candidates if c and c.strip()]
+    if not filtered:
+        raise HTTPException(status_code=503, detail="All candidate generations failed.")
+
+    # Group into chunks of 10 and synth each group (in parallel)
+    groups = _chunk(filtered, GROUP_SIZE)
+    client = OpenAI(api_key=api_key)
+
+    def synth_group(group: List[str]) -> str:
+        return _synthesize(client, group)
+
+    with cf.ThreadPoolExecutor(max_workers=min(len(groups), MAX_WORKERS)) as ex:
+        group_futures = [ex.submit(synth_group, g) for g in groups]
+        group_winners = [f.result() for f in group_futures]
+
+    # Final: synth across group winners
+    final_text = _synthesize(client, group_winners)
+    return ProModeResponse(final=final_text, candidates=candidates)
+
+def _pro_mode(api_key: str, prompt: str, n_runs: int) -> ProModeResponse:
+    if n_runs > TOURNAMENT_THRESHOLD:
+        return _pro_mode_tournament(api_key, prompt, n_runs)
+    else:
+        return _pro_mode_simple(api_key, prompt, n_runs)
 
 # ---------- Routes ----------
 @app.post("/pro-mode", response_model=ProModeResponse)
 def pro_mode_endpoint(body: ProModeRequest):
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise HTTPException(
-            status_code=500,
-            detail="OPENAI_API_KEY not set in environment."
-        )
+        raise HTTPException(status_code=500, detail="OPENAI_API_KEY not set in environment.")
     try:
         return _pro_mode(api_key=api_key, prompt=body.prompt, n_runs=body.num_gens)
     except HTTPException:
