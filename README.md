@@ -1,4 +1,4 @@
-# gpt-oss-pro-mode
+# gpt-pro-mode
 
 [![Twitter Follow](https://img.shields.io/twitter/follow/mattshumer_?style=social)](https://x.com/mattshumer_)
 
