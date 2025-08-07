@@ -25,3 +25,5 @@ curl -X POST http://localhost:8000/pro-mode \
   -H "Content-Type: application/json" \
   -d '{"prompt":"Explain self-play in RL with a concrete example.","num_gens":5}'
 ```
+
+New: tournament mode! If `num_gens` is `> 20`, it generates and synthesizes in groups of 10, then synthesizes the them all into one; otherwise, it does the regular single-pass synth.
