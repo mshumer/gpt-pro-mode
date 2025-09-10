@@ -6,6 +6,8 @@ gpt-oss-pro-mode: [![Open Notebook In Colab](https://colab.research.google.com/a
 
 gpt-5-pro-mode: [![Open Notebook In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1vD7T-qkfWrx8-bBUsxI09w5su0K6J4Xp?usp=sharing)
 
+nemotron-pro-mode: [![Open Notebook In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/106-H2XW4HW7xooxOLn4AhA1asrcjrce_?usp=sharing)
+
 Run the attached notebooks to access Pro Mode! Star this repo and let me know what you want me to add!
 
 You can also set up the integrated Pro Mode API endpoint.
